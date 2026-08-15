@@ -13,6 +13,18 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.widgets import Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
+_FENCE_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+
+
+def _fenced_blocks(text: str) -> list[str]:
+    """Return every ```fenced``` code block's inner text (trimmed), in order.
+
+    Lets Ctrl+X copy a payload the brain CRAFTED into a code block even when it
+    was never fired at a target — query_target sets _last_payload, but a bare
+    "here is the prompt" turn does not, which is the gap this closes.
+    """
+    return [b.strip() for b in _FENCE_RE.findall(text or "") if b.strip()]
+
 
 class PromptInput(Input):
     """Single-line Input that also accepts multi-line pastes and manual soft-newlines.
@@ -176,7 +188,7 @@ HELP_TEXT = """☠ RTFM // TEH SL45H K0MM4NDZ, D00D ☠
 /clear                clear the conversation
 /quit                 exit
 
-Ctrl+S report · Ctrl+Y copy payload · Ctrl+T stats · Ctrl+R repro · Ctrl+L clear · Ctrl+C quit
+Ctrl+S report · Ctrl+Y copy payload · Ctrl+X copy craft · Ctrl+T stats · Ctrl+R repro · Ctrl+L clear · Ctrl+C quit
 
 Up / Down arrows recall your previous inputs into the prompt.
 MULTI-LINE: paste a multi-line block and the whole thing is captured (not just line 1);
@@ -262,6 +274,7 @@ class RthApp(App):
         ("ctrl+l", "clear_log", "Clear"),
         ("ctrl+s", "report", "Report"),
         ("ctrl+y", "copy_payload", "Copy payload"),
+        ("ctrl+x", "copy_craft", "Copy craft"),
         ("ctrl+t", "stats", "Stats"),
         ("ctrl+r", "repro", "Repro"),
         ("ctrl+b", "toggle_sidebar", "Sidebar"),
@@ -302,6 +315,8 @@ class RthApp(App):
         self._cmd_menu_items: list[str] = []
         self._session_picker_open = False
         self._session_picker_items: list[str] = []
+        self._block_picker_open = False
+        self._code_blocks: list[str] = []
         self.runlog = RunLog()
         self.runlog.enabled = bool(prefs.get("log", True))
         if config.target:
@@ -403,6 +418,7 @@ class RthApp(App):
             yield VerticalScroll(id="log")
             yield StatsPanel(id="sidebar")
         yield OptionList(id="session-picker", classes="hidden")
+        yield OptionList(id="block-picker", classes="hidden")
         yield OptionList(id="command-menu", classes="hidden")
         yield Static("", id="compose-preview", classes="hidden")
         yield PromptInput(placeholder="TYP3 UR H4X, D00D  ▪  /help = RTFM  ▪  ctrl+j = m04R L1N3Z", id="prompt")
@@ -757,6 +773,13 @@ class RthApp(App):
                 event.prevent_default()
                 event.stop()
             return
+        # the block picker likewise owns focus (arrows/enter go to the OptionList)
+        if self._block_picker_open:
+            if event.key == "escape":
+                self._close_block_picker()
+                event.prevent_default()
+                event.stop()
+            return
         inp = self.query_one("#prompt", Input)
         if not inp.has_focus:
             return
@@ -988,6 +1011,12 @@ class RthApp(App):
     def _on_turn_end(self, message) -> None:
         self._assistant = None
         self.runlog.assistant(message.text())
+        # remember any code blocks the brain CRAFTED this turn so Ctrl+X can copy
+        # them even if they were never fired (only replace on a turn that had some,
+        # so a plain prose turn doesn't wipe the last good craft).
+        blocks = _fenced_blocks(message.text())
+        if blocks:
+            self._code_blocks = blocks
 
     def _on_reasoning(self, text: str) -> None:
         """The brain's chain-of-thought for this turn: persist it and show it dimmed."""
@@ -1095,6 +1124,67 @@ class RthApp(App):
         except Exception:
             note = f"clipboard unavailable; last payload:\n{self._last_payload[:500]}"
         self._mount(widgets.info_panel(note, title="copy"))
+
+    def action_copy_craft(self) -> None:
+        """Copy a code block the brain crafted — even if it was never fired.
+
+        0 blocks -> fall back to the last fired payload; 1 -> copy it straight;
+        >1 -> pop a picker so you choose which variant.
+        """
+        blocks = self._code_blocks
+        if not blocks:
+            if self._last_payload:
+                self._copy_text(self._last_payload, "no code block yet — copied last payload")
+            else:
+                self._mount(widgets.info_panel(
+                    "no crafted code block yet (and nothing fired)", title="copy"))
+            return
+        if len(blocks) == 1:
+            self._copy_text(blocks[0], "crafted block copied to clipboard")
+            return
+        self._open_block_picker(blocks)
+
+    def _copy_text(self, text: str, ok_note: str) -> None:
+        try:
+            self.copy_to_clipboard(text)
+            note = ok_note
+        except Exception:
+            note = f"clipboard unavailable; text:\n{text[:500]}"
+        self._mount(widgets.info_panel(note, title="copy"))
+
+    def _block_option_label(self, i: int, block: str) -> Text:
+        first = block.strip().splitlines()[0] if block.strip() else ""
+        label = Text()
+        label.append(f"{i + 1:>2}  ", style=f"bold {PALETTE['accent']}")
+        label.append(f"{first[:60]:<60}", style=PALETTE["secondary"])
+        label.append(f"  {len(block)}ch", style=PALETTE["label"])
+        return label
+
+    def _open_block_picker(self, blocks: list[str]) -> None:
+        picker = self.query_one("#block-picker", OptionList)
+        picker.clear_options()
+        for i, block in enumerate(blocks):
+            picker.add_option(Option(self._block_option_label(i, block), id=str(i)))
+        picker.border_title = (
+            f"p1ck bl0ck 2 c0py ({len(blocks)}) · enter=c0py · esc=c4nc3l"
+        )
+        picker.remove_class("hidden")
+        picker.highlighted = 0
+        picker.focus()
+        self._block_picker_open = True
+
+    def _close_block_picker(self) -> None:
+        self._block_picker_open = False
+        try:
+            picker = self.query_one("#block-picker", OptionList)
+            picker.add_class("hidden")
+            picker.clear_options()
+        except Exception:
+            pass
+        try:
+            self.query_one("#prompt", Input).focus()
+        except Exception:
+            pass
 
     def _clear(self) -> None:
         self.history = []
@@ -2387,6 +2477,14 @@ class RthApp(App):
             self._close_session_picker()
             if path:
                 self._load_session_path(path)
+        elif oid == "block-picker":
+            idx = int(event.option.id) if event.option.id is not None else -1
+            self._close_block_picker()
+            if 0 <= idx < len(self._code_blocks):
+                self._copy_text(
+                    self._code_blocks[idx],
+                    f"block {idx + 1}/{len(self._code_blocks)} copied to clipboard",
+                )
         elif oid == "command-menu":
             cmd = event.option.id
             inp = self.query_one("#prompt", Input)

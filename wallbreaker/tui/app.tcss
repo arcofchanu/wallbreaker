@@ -82,6 +82,22 @@ Screen {
     display: none;
 }
 
+#block-picker {
+    layer: overlay;
+    dock: bottom;
+    height: auto;
+    max-height: 16;
+    margin: 0 1 5 1;
+    border: heavy $accent;
+    border-title-color: $accent;
+    background: $surface;
+    scrollbar-size-vertical: 1;
+}
+
+#block-picker.hidden {
+    display: none;
+}
+
 #compose-preview {
     dock: bottom;
     max-height: 10;
